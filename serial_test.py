@@ -13,16 +13,4 @@ def Send(a):
   data.write(str.encode(a))
   print('sent............')
 
-##
-##Send('X')
 
-##def Read():
-
-
-##while True:
-##  Data = data.readline()
-##  Data1 = Data.decode('utf-8', 'ignore')
-##  print("Data{}".format(Data))
-##
-##  if '00' in str(Data):
-##    print('Detected')

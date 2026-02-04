@@ -1,22 +1,43 @@
+# YOLOv5 🚀 by Ultralytics, AGPL-3.0 license
+"""
+Run YOLOv5 segmentation inference on images, videos, directories, streams, etc.
 
+Usage - sources:
+    $ python segment/predict.py --weights yolov5s-seg.pt --source 0                               # webcam
+                                                                  img.jpg                         # image
+                                                                  vid.mp4                         # video
+                                                                  screen                          # screenshot
+                                                                  path/                           # directory
+                                                                  list.txt                        # list of images
+                                                                  list.streams                    # list of streams
+                                                                  'path/*.jpg'                    # glob
+                                                                  'https://youtu.be/LNwODJXcvt4'  # YouTube
+                                                                  'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP stream
+
+Usage - formats:
+    $ python segment/predict.py --weights yolov5s-seg.pt                 # PyTorch
+                                          yolov5s-seg.torchscript        # TorchScript
+                                          yolov5s-seg.onnx               # ONNX Runtime or OpenCV DNN with --dnn
+                                          yolov5s-seg_openvino_model     # OpenVINO
+                                          yolov5s-seg.engine             # TensorRT
+                                          yolov5s-seg.mlmodel            # CoreML (macOS-only)
+                                          yolov5s-seg_saved_model        # TensorFlow SavedModel
+                                          yolov5s-seg.pb                 # TensorFlow GraphDef
+                                          yolov5s-seg.tflite             # TensorFlow Lite
+                                          yolov5s-seg_edgetpu.tflite     # TensorFlow Edge TPU
+                                          yolov5s-seg_paddle_model       # PaddlePaddle
+"""
 
 import argparse
-import csv
 import os
 import platform
 import sys
 from pathlib import Path
 
-from serial_test import Send
-
-import pathlib
-temp = pathlib.PosixPath
-pathlib.PosixPath = pathlib.WindowsPath
-
 import torch
 
 FILE = Path(__file__).resolve()
-ROOT = FILE.parents[0]  # YOLOv5 root directory
+ROOT = FILE.parents[1]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
@@ -36,17 +57,18 @@ from utils.general import (
     cv2,
     increment_path,
     non_max_suppression,
-         print_args,
+    print_args,
     scale_boxes,
+    scale_segments,
     strip_optimizer,
-    xyxy2xywh,
 )
+from utils.segment.general import masks2segments, process_mask, process_mask_native
 from utils.torch_utils import select_device, smart_inference_mode
 
-from serial_test import Send
+
 @smart_inference_mode()
 def run(
-    weights=ROOT / "yolov5s.pt",  # model path or triton URL
+    weights=ROOT / "yolov5s-seg.pt",  # model.pt path(s)
     source=ROOT / "data/images",  # file/dir/URL/glob/screen/0(webcam)
     data=ROOT / "data/coco128.yaml",  # dataset.yaml path
     imgsz=(640, 640),  # inference size (height, width)
@@ -56,7 +78,6 @@ def run(
     device="",  # cuda device, i.e. 0 or 0,1,2,3 or cpu
     view_img=False,  # show results
     save_txt=False,  # save results to *.txt
-    save_csv=False,  # save results in CSV format
     save_conf=False,  # save confidences in --save-txt labels
     save_crop=False,  # save cropped prediction boxes
     nosave=False,  # do not save images/videos
@@ -65,7 +86,7 @@ def run(
     augment=False,  # augmented inference
     visualize=False,  # visualize features
     update=False,  # update all models
-    project=ROOT / "runs/detect",  # save results to project/name
+    project=ROOT / "runs/predict-seg",  # save results to project/name
     name="exp",  # save results to project/name
     exist_ok=False,  # existing project/name ok, do not increment
     line_thickness=3,  # bounding box thickness (pixels)
@@ -74,6 +95,7 @@ def run(
     half=False,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
     vid_stride=1,  # video frame-rate stride
+    retina_masks=False,
 ):
     source = str(source)
     save_img = not nosave and not source.endswith(".txt")  # save inference images
@@ -107,7 +129,7 @@ def run(
     vid_path, vid_writer = [None] * bs, [None] * bs
 
     # Run inference
-    model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
+    model.warmup(imgsz=(1 if pt else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
@@ -116,41 +138,18 @@ def run(
             im /= 255  # 0 - 255 to 0.0 - 1.0
             if len(im.shape) == 3:
                 im = im[None]  # expand for batch dim
-            if model.xml and im.shape[0] > 1:
-                ims = torch.chunk(im, im.shape[0], 0)
 
         # Inference
         with dt[1]:
             visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
-            if model.xml and im.shape[0] > 1:
-                pred = None
-                for image in ims:
-                    if pred is None:
-                        pred = model(image, augment=augment, visualize=visualize).unsqueeze(0)
-                    else:
-                        pred = torch.cat((pred, model(image, augment=augment, visualize=visualize).unsqueeze(0)), dim=0)
-                pred = [pred, None]
-            else:
-                pred = model(im, augment=augment, visualize=visualize)
+            pred, proto = model(im, augment=augment, visualize=visualize)[:2]
+
         # NMS
         with dt[2]:
-            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det, nm=32)
 
         # Second-stage classifier (optional)
         # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
-
-        # Define the path for the CSV file
-        csv_path = save_dir / "predictions.csv"
-
-        # Create or append to the CSV file
-        def write_to_csv(image_name, prediction, confidence):
-            """Writes prediction data for an image to a CSV file, appending if the file exists."""
-            data = {"Image Name": image_name, "Prediction": prediction, "Confidence": confidence}
-            with open(csv_path, mode="a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=data.keys())
-                if not csv_path.is_file():
-                    writer.writeheader()
-                writer.writerow(data)
 
         # Process predictions
         for i, det in enumerate(pred):  # per image
@@ -165,31 +164,44 @@ def run(
             save_path = str(save_dir / p.name)  # im.jpg
             txt_path = str(save_dir / "labels" / p.stem) + ("" if dataset.mode == "image" else f"_{frame}")  # im.txt
             s += "%gx%g " % im.shape[2:]  # print string
-            gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
             if len(det):
-                # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+                if retina_masks:
+                    # scale bbox first the crop masks
+                    det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()  # rescale boxes to im0 size
+                    masks = process_mask_native(proto[i], det[:, 6:], det[:, :4], im0.shape[:2])  # HWC
+                else:
+                    masks = process_mask(proto[i], det[:, 6:], det[:, :4], im.shape[2:], upsample=True)  # HWC
+                    det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()  # rescale boxes to im0 size
+
+                # Segments
+                if save_txt:
+                    segments = [
+                        scale_segments(im0.shape if retina_masks else im.shape[2:], x, im0.shape, normalize=True)
+                        for x in reversed(masks2segments(masks))
+                    ]
 
                 # Print results
                 for c in det[:, 5].unique():
                     n = (det[:, 5] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
+                # Mask plotting
+                annotator.masks(
+                    masks,
+                    colors=[colors(x, True) for x in det[:, 5]],
+                    im_gpu=torch.as_tensor(im0, dtype=torch.float16).to(device).permute(2, 0, 1).flip(0).contiguous()
+                    / 255
+                    if retina_masks
+                    else im[i],
+                )
+
                 # Write results
-                for *xyxy, conf, cls in reversed(det):
-                    c = int(cls)  # integer class
-                    label = names[c] if hide_conf else f"{names[c]}"
-                    confidence = float(conf)
-                    confidence_str = f"{confidence:.2f}"
-
-                    if save_csv:
-                        write_to_csv(p.name, label, confidence_str)
-
+                for j, (*xyxy, conf, cls) in enumerate(reversed(det[:, :6])):
                     if save_txt:  # Write to file
-                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                        seg = segments[j].reshape(-1)  # (n,2) to (n*2)
+                        line = (cls, *seg, conf) if save_conf else (cls, *seg)  # label format
                         with open(f"{txt_path}.txt", "a") as f:
                             f.write(("%g " * len(line)).rstrip() % line + "\n")
 
@@ -197,7 +209,7 @@ def run(
                         c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
                         annotator.box_label(xyxy, label, color=colors(c, True))
-                        Send('X')
+                        # annotator.draw.polygon(segments[j], outline=colors(c, True), width=3)
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
 
@@ -209,13 +221,13 @@ def run(
                     cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
                     cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
                 cv2.imshow(str(p), im0)
-                cv2.waitKey(1)  # 1 millisecond
+                if cv2.waitKey(1) == ord("q"):  # 1 millisecond
+                    exit()
 
             # Save results (image with detections)
             if save_img:
                 if dataset.mode == "image":
                     cv2.imwrite(save_path, im0)
-                    Send('X')
                 else:  # 'video' or 'stream'
                     if vid_path[i] != save_path:  # new video
                         vid_path[i] = save_path
@@ -245,10 +257,12 @@ def run(
 
 
 def parse_opt():
-    """Parses command-line arguments for YOLOv5 detection, setting inference options and model configurations."""
+    """Parses command-line options for YOLOv5 inference including model paths, data sources, inference settings, and
+    output preferences.
+    """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "best.pt", help="model path or triton URL")
-    parser.add_argument("--source", type=str, default=ROOT / "0", help="file/dir/URL/glob/screen/0(webcam)")
+    parser.add_argument("--weights", nargs="+", type=str, default=ROOT / "yolov5s-seg.pt", help="model path(s)")
+    parser.add_argument("--source", type=str, default=ROOT / "data/images", help="file/dir/URL/glob/screen/0(webcam)")
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="(optional) dataset.yaml path")
     parser.add_argument("--imgsz", "--img", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w")
     parser.add_argument("--conf-thres", type=float, default=0.25, help="confidence threshold")
@@ -257,7 +271,6 @@ def parse_opt():
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--view-img", action="store_true", help="show results")
     parser.add_argument("--save-txt", action="store_true", help="save results to *.txt")
-    parser.add_argument("--save-csv", action="store_true", help="save results in CSV format")
     parser.add_argument("--save-conf", action="store_true", help="save confidences in --save-txt labels")
     parser.add_argument("--save-crop", action="store_true", help="save cropped prediction boxes")
     parser.add_argument("--nosave", action="store_true", help="do not save images/videos")
@@ -266,7 +279,7 @@ def parse_opt():
     parser.add_argument("--augment", action="store_true", help="augmented inference")
     parser.add_argument("--visualize", action="store_true", help="visualize features")
     parser.add_argument("--update", action="store_true", help="update all models")
-    parser.add_argument("--project", default=ROOT / "runs/detect", help="save results to project/name")
+    parser.add_argument("--project", default=ROOT / "runs/predict-seg", help="save results to project/name")
     parser.add_argument("--name", default="exp", help="save results to project/name")
     parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
     parser.add_argument("--line-thickness", default=3, type=int, help="bounding box thickness (pixels)")
@@ -275,6 +288,7 @@ def parse_opt():
     parser.add_argument("--half", action="store_true", help="use FP16 half-precision inference")
     parser.add_argument("--dnn", action="store_true", help="use OpenCV DNN for ONNX inference")
     parser.add_argument("--vid-stride", type=int, default=1, help="video frame-rate stride")
+    parser.add_argument("--retina-masks", action="store_true", help="whether to plot masks in native resolution")
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
@@ -282,7 +296,7 @@ def parse_opt():
 
 
 def main(opt):
-    """Executes YOLOv5 model inference with given options, checking requirements before running the model."""
+    """Executes YOLOv5 model inference with given options, checking for requirements before launching."""
     check_requirements(ROOT / "requirements.txt", exclude=("tensorboard", "thop"))
     run(**vars(opt))
 
